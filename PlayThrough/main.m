@@ -17,19 +17,24 @@
 
 #pragma mark - User Data Struct
 // listing 4.3
-typedef struct MyRecorder {
-    AudioFileID recordFile;
-    SInt64      recordPacket;
-    Boolean     running;
-} MyRecorder;
+
+struct MyRecorder;
 
 typedef struct MyPlayer {
-    AudioFileID playbackFile;
+    AudioQueueRef playerQueue;
     SInt64 packetPosition;
     UInt32 numPacketsToRead;
     AudioStreamPacketDescription *packetDescs;
     Boolean isDone;
+    struct MyRecorder *recorder;
 } MyPlayer;
+
+typedef struct MyRecorder {
+    AudioQueueRef recordQueue;
+    SInt64      recordPacket;
+    Boolean     running;
+    MyPlayer    *player;
+} MyRecorder;
 
 #pragma mark - Utility functions
 
@@ -46,6 +51,7 @@ static void CheckError(OSStatus error, const char *operation) {
         errorString[6] = '\0';
     } else {
         // No, format it as an integer
+        NSLog(@"Was integer");
         sprintf(errorString, "%d",(int)error);
     }
     
@@ -158,17 +164,50 @@ static int MyComputeRecordBufferSize(const AudioStreamBasicDescription *format, 
 
 // Player
 // Not sure how this will work -- hopefully just use CBR?
-void CalculateBytesForTime(AudioFileID inAudioFile,
-                           AudioStreamBasicDescription inDesc,
-                           Float64 inSeconds,
-                           UInt32 *outBufferSize,
-                           UInt32 *outNumPackets)
+//void CalculateBytesForTime(AudioFileID inAudioFile,
+//                           AudioStreamBasicDescription inDesc,
+//                           Float64 inSeconds,
+//                           UInt32 *outBufferSize,
+//                           UInt32 *outNumPackets)
+//{
+//    UInt32 maxPacketSize;
+//    UInt32 propSize = sizeof(maxPacketSize);
+//    CheckError(AudioFileGetProperty(inAudioFile,
+//                                    kAudioFilePropertyPacketSizeUpperBound,
+//                                    &propSize, &maxPacketSize), "Couldn't get file's max packet size");
+//    
+//    static const int maxBufferSize = 0x10000;
+//    static const int minBufferSize = 0x4000;
+//    
+//    if (inDesc.mFramesPerPacket) {
+//        Float64 numPacketsForTime = inDesc.mSampleRate / inDesc.mFramesPerPacket * inSeconds;
+//        *outBufferSize = numPacketsForTime * maxPacketSize;
+//    } else {
+//        *outBufferSize = maxBufferSize > maxPacketSize ? maxBufferSize : maxPacketSize;
+//    }
+//    
+//    if (*outBufferSize > maxBufferSize &&
+//        *outBufferSize > maxPacketSize) {
+//        *outBufferSize = maxBufferSize;
+//    } else {
+//        if (*outBufferSize < minBufferSize) {
+//            *outBufferSize = minBufferSize;
+//        }
+//    }
+//    *outNumPackets = *outBufferSize / maxPacketSize;
+//}
+
+void CalculateBytesForPlaythrough(AudioQueueRef queue,
+                                  AudioStreamBasicDescription inDesc,
+                                  Float64 inSeconds,
+                                  UInt32 *outBufferSize,
+                                  UInt32 *outNumPackets)
 {
     UInt32 maxPacketSize;
     UInt32 propSize = sizeof(maxPacketSize);
-    CheckError(AudioFileGetProperty(inAudioFile,
-                                    kAudioFilePropertyPacketSizeUpperBound,
-                                    &propSize, &maxPacketSize), "Couldn't get file's max packet size");
+    CheckError(AudioQueueGetProperty(queue,
+                                    kAudioQueueProperty_MaximumOutputPacketSize,
+                                    &maxPacketSize, &propSize), "Couldn't get file's max packet size");
     
     static const int maxBufferSize = 0x10000;
     static const int minBufferSize = 0x4000;
@@ -201,15 +240,28 @@ static void MyAQInputCallback(void *inUserData,
                               UInt32 inNumPackets,
                               const AudioStreamPacketDescription *inPacketDesc)
 {
+//    NSLog(@"Input callback");
+    NSLog(@"Input thread = %@",[NSThread currentThread]);
     MyRecorder *recorder = (MyRecorder *)inUserData;
+    MyPlayer *player = recorder->player;
     
     if (inNumPackets > 0) {
-        // Write packets to a file
-        CheckError(AudioFileWritePackets(recorder->recordFile, FALSE, inBuffer->mAudioDataByteSize, inPacketDesc, recorder->recordPacket, &inNumPackets, inBuffer->mAudioData), "AudioFileWritePackets failed");
         
-        // Increment the packet index
+        // Enqueue on the output Queue!
+        AudioQueueBufferRef outputBuffer;
+        CheckError(AudioQueueAllocateBuffer(player->playerQueue, inBuffer->mAudioDataBytesCapacity, &outputBuffer), "Input callback failed to allocate new output buffer");
+        
+        
+        memcpy(outputBuffer->mAudioData, inBuffer->mAudioData, inBuffer->mAudioDataByteSize);
+        outputBuffer->mAudioDataByteSize = inBuffer->mAudioDataByteSize;
+        
+        [NSData dataWithBytes:inBuffer->mAudioData length:inBuffer->mAudioDataByteSize];
+        
+        // Assuming LPCM so no packet descriptions
+        CheckError(AudioQueueEnqueueBuffer(player->playerQueue, outputBuffer, 0, NULL), "Enqueing the buffer in input callback failed");
         recorder->recordPacket += inNumPackets;
     }
+    
     
     if (recorder->running) {
         CheckError(AudioQueueEnqueueBuffer(inQueue, inBuffer, 0, NULL), "AudioQueueEnqueueBuffer failed");
@@ -218,39 +270,58 @@ static void MyAQInputCallback(void *inUserData,
 
 static void MyAQOutputCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inCompleteAQBuffer)
 {
+    NSLog(@"Output thread = %@",[NSThread currentThread]);
+//    NSLog(@"Output callback");
     MyPlayer *aqp = (MyPlayer *)inUserData;
+    MyRecorder *recorder = aqp->recorder;
     if (aqp->isDone) return;
     
-    UInt32 numBytes;
-    UInt32 nPackets = aqp->numPacketsToRead;
-    CheckError(AudioFileReadPackets(aqp->playbackFile, false,
-                                    &numBytes,
-                                    aqp->packetDescs,
-                                    aqp->packetPosition,
-                                    &nPackets,
-                                    inCompleteAQBuffer->mAudioData), "AudioFileReadPackets failed");
     
     
-    if (nPackets > 0) {
-        inCompleteAQBuffer->mAudioDataByteSize = numBytes;
-        AudioQueueEnqueueBuffer(inAQ, inCompleteAQBuffer, (aqp->packetDescs ? nPackets : 0), aqp->packetDescs);
-        aqp->packetPosition += nPackets;
-    } else {
-        CheckError(AudioQueueStop(inAQ, false), "AudioQueueStop failed");
-        aqp->isDone = true;
-    }
+//    CheckError(AudioQueueEnqueueBuffer(recorder->recordQueue, inCompleteAQBuffer, 0, NULL), "Enqueing the buffer in **OUTPUT** callback failed");
+//
+//    UInt32 numBytes;
+//    UInt32 nPackets = aqp->numPacketsToRead;
+//    CheckError(AudioFileReadPackets(aqp->playbackFile, false,
+//                                    &numBytes,
+//                                    aqp->packetDescs,
+//                                    aqp->packetPosition,
+//                                    &nPackets,
+//                                    inCompleteAQBuffer->mAudioData), "AudioFileReadPackets failed");
+//
+//    
+//    if (nPackets > 0) {
+//        inCompleteAQBuffer->mAudioDataByteSize = numBytes;
+//        AudioQueueEnqueueBuffer(inAQ, inCompleteAQBuffer, (aqp->packetDescs ? nPackets : 0), aqp->packetDescs);
+//        aqp->packetPosition += nPackets;
+//    } else {
+//        CheckError(AudioQueueStop(inAQ, false), "AudioQueueStop failed");
+//        aqp->isDone = true;
+//    }
 }
-/*
+
 int main(int argc, const char * argv[])
 {
     
     @autoreleasepool {
         MyRecorder recorder = {0};
+        MyPlayer player = {0};
+        
+        recorder.player = &player;
+        player.recorder = &recorder;
+        
         AudioStreamBasicDescription recordFormat;
         memset(&recordFormat, 0, sizeof(recordFormat));
         
-        recordFormat.mFormatID = kAudioFormatAppleLossless;
+        recordFormat.mFormatID = kAudioFormatLinearPCM;
         recordFormat.mChannelsPerFrame = 2; //stereo
+        
+        // Begin my changes to make LPCM work
+            recordFormat.mBitsPerChannel = 16;
+            // Haven't checked if each of these flags is necessary, this is just what Chapter 2 used for LPCM.
+            recordFormat.mFormatFlags = kAudioFormatFlagIsBigEndian | kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        
+        // end my changes
         
         MyGetDefaultInputDeviceSampleRate(&recordFormat.mSampleRate);
         
@@ -267,6 +338,8 @@ int main(int argc, const char * argv[])
         
         CheckError(AudioQueueNewInput(&recordFormat, MyAQInputCallback, &recorder, NULL, NULL, 0, &queue), "AudioQueueNewInput failed");
         
+        recorder.recordQueue = queue;
+        
         // Fills in ABSD a little more
         UInt32 size = sizeof(recordFormat);
         CheckError(AudioQueueGetProperty(queue,
@@ -274,18 +347,18 @@ int main(int argc, const char * argv[])
                                          &recordFormat,
                                          &size), "Couldn't get queue's format");
         
-        CFURLRef myFileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-                                                           CFSTR("output.caf"), kCFURLPOSIXPathStyle, false);
-        CheckError(AudioFileCreateWithURL(myFileURL, kAudioFileCAFType,
-                                          &recordFormat,
-                                          kAudioFileFlags_EraseFile,
-                                          &recorder.recordFile), "AudioFileCreateWithURL failed");
-        CFRelease(myFileURL);
+//        CFURLRef myFileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
+//                                                           CFSTR("output.caf"), kCFURLPOSIXPathStyle, false);
+//        CheckError(AudioFileCreateWithURL(myFileURL, kAudioFileCAFType,
+//                                          &recordFormat,
+//                                          kAudioFileFlags_EraseFile,
+//                                          &recorder.recordFile), "AudioFileCreateWithURL failed");
+//        CFRelease(myFileURL);
         
-        MyCopyEncoderCookieToFile(queue, recorder.recordFile);
+//        MyCopyEncoderCookieToFile(queue, recorder.recordFile);
         
         int bufferByteSize = MyComputeRecordBufferSize(&recordFormat,queue,0.5);
-        
+        NSLog(@"%d",__LINE__);
         // Create and Enqueue buffers
         int bufferIndex;
         for (bufferIndex = 0;
@@ -297,98 +370,150 @@ int main(int argc, const char * argv[])
                                                 &buffer), "AudioQueueBufferRef failed");
             CheckError(AudioQueueEnqueueBuffer(queue, buffer, 0, NULL), "AudioQueueEnqueueBuffer failed");
         }
+        NSLog(@"%d",__LINE__);
+        // PLAYBACK SETUP
+        
+        AudioQueueRef playbackQueue;
+        CheckError(AudioQueueNewOutput(&recordFormat,
+                                       MyAQOutputCallback,
+                                       &player, NULL, NULL, 0,
+                                       &playbackQueue), "AudioOutputNewQueue failed");
+        player.playerQueue = playbackQueue;
+        NSLog(@"%d",__LINE__);
+        
+        UInt32 playBufferByteSize;
+        CalculateBytesForPlaythrough(queue, recordFormat, 0.1, &playBufferByteSize, &player.numPacketsToRead);
+        
+        bool isFormatVBR = (recordFormat.mBytesPerPacket == 0
+                            || recordFormat.mFramesPerPacket == 0);
+        if (isFormatVBR) {
+            NSLog(@"Very bad htis is vbr");
+            player.packetDescs = (AudioStreamPacketDescription*) malloc(sizeof(AudioStreamPacketDescription) * player.numPacketsToRead);
+        } else {
+            player.packetDescs = NULL;
+        }
+        
+        
+//        NSLog(@"%d",__LINE__);
+//        AudioQueueBufferRef buffers[kNumberPlaybackBuffers];
+//        player.isDone = false;
+//        player.packetPosition = 0;
+//        for (int i=0; i<kNumberPlaybackBuffers; i++) {
+//            CheckError(AudioQueueAllocateBuffer(playbackQueue,
+//                                                bufferByteSize,
+//                                                &buffers[i]), "AudioQueueAllocateBuffer failed");
+//            
+//            AudioQueueEnqueueBuffer(playbackQueue, buffers[i], 0, NULL);
+//            
+//            if (player.isDone) {
+//                break;
+//            }
+//        }
+//
+        
+        // END PLAYBACK
+        NSLog(@"%d",__LINE__);
         
         recorder.running = TRUE;
+        player.isDone = false;
+        
+        
+        CheckError(AudioQueueStart(playbackQueue, NULL), "AudioQueueStart failed");
         CheckError(AudioQueueStart(queue, NULL), "AudioQueueStart failed");
+        
+        
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10, TRUE);
         
         printf("Recordering, press <return> to stop:\n");
         getchar();
         
         printf("* recording done *\n");
         recorder.running = FALSE;
+        player.isDone = true;
+        CheckError(AudioQueueStop(playbackQueue, false), "Failed to stop playback queue");
         
         CheckError(AudioQueueStop(queue, TRUE), "AudioQueueStop failed");
         
-        MyCopyEncoderCookieToFile(queue, recorder.recordFile);
+//        MyCopyEncoderCookieToFile(queue, recorder.recordFile);
         
         AudioQueueDispose(queue, TRUE);
-        AudioFileClose(recorder.recordFile);
+//        AudioFileClose(recorder.recordFile);
     }
     return 0;
 }
-*/
-int main(int argc, const char * argv[])
-{
-    
-    @autoreleasepool {
-        // Open an audio file
-        MyPlayer player = {0};
-        
-        CFURLRef myFileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-                                                           kPlaybackFileLocation, kCFURLPOSIXPathStyle, false);
-        CheckError(AudioFileOpenURL(myFileURL, kAudioFileReadPermission, 0, &player.playbackFile), "AudioFileOpenURL failed");
-        CFRelease(myFileURL);
-        
-        // Set up format
-        AudioStreamBasicDescription dataFormat;
-        UInt32 propSize = sizeof(dataFormat);
-        CheckError(AudioFileGetProperty(player.playbackFile, kAudioFilePropertyDataFormat, &propSize, &dataFormat), "Couldn't get file's data format");
-        
-        // Set up Queue
-        AudioQueueRef queue;
-        CheckError(AudioQueueNewOutput(&dataFormat,
-                                       MyAQOutputCallback,
-                                       &player, NULL, NULL, 0,
-                                       &queue), "AudioOutputNewQueue failed");
-        
-        UInt32 bufferByteSize;
-        CalculateBytesForTime(player.playbackFile, dataFormat, 0.1, &bufferByteSize,&player.numPacketsToRead);
-        
-        bool isFormatVBR = (dataFormat.mBytesPerPacket == 0
-                            || dataFormat.mFramesPerPacket == 0);
-        if (isFormatVBR) {
-            player.packetDescs = (AudioStreamPacketDescription*) malloc(sizeof(AudioStreamPacketDescription) * player.numPacketsToRead);
-        } else {
-            player.packetDescs = NULL;
-        }
-        
-        MyCopyEncoderCookieToQueue(player.playbackFile, queue);
-        
-        
-        // Player will start immediately, so we need to fill it with some data so that it doesn't play silence into the file
-        // Call the callback function manually to solve
-        
-        AudioQueueBufferRef buffers[kNumberPlaybackBuffers];
-        player.isDone = false;
-        player.packetPosition = 0;
-        for (int i=0; i<kNumberPlaybackBuffers; i++) {
-            CheckError(AudioQueueAllocateBuffer(queue,
-                                                bufferByteSize,
-                                                &buffers[i]), "AudioQueueAllocateBuffer failed");
-            MyAQOutputCallback(&player, queue, buffers[i]);
-            
-            if (player.isDone) {
-                break;
-            }
-        }
-        
-        // Start Queue
-        CheckError(AudioQueueStart(queue, NULL), "AudioQueueStart failed");
-        
-        printf("Playing...\n");
-        
-        do {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
-        } while (!player.isDone);
-        
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2, false); // Handle any audio that may remain in buffers
-        
-        // Clean up queue when finished
-        player.isDone = true;
-        CheckError(AudioQueueStop(queue, TRUE), "AudioQueueStop failed");
-        AudioFileClose(player.playbackFile);
-        
-    }
-    return 0;
-}
+
+//int main(int argc, const char * argv[])
+//{
+//    
+//    @autoreleasepool {
+//        // Open an audio file
+//        
+//        
+////        CFURLRef myFileURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
+//                                                           kPlaybackFileLocation, kCFURLPOSIXPathStyle, false);
+////        CheckError(AudioFileOpenURL(myFileURL, kAudioFileReadPermission, 0, &player.playbackFile), "AudioFileOpenURL failed");
+////        CFRelease(myFileURL);
+//        
+//        // Set up format
+//        AudioStreamBasicDescription dataFormat;
+//        UInt32 propSize = sizeof(dataFormat);
+//        CheckError(AudioFileGetProperty(player.playbackFile, kAudioFilePropertyDataFormat, &propSize, &dataFormat), "Couldn't get file's data format");
+//        
+//        // Set up Queue
+//        AudioQueueRef queue;
+////        CheckError(AudioQueueNewOutput(&dataFormat,
+////                                       MyAQOutputCallback,
+////                                       &player, NULL, NULL, 0,
+////                                       &queue), "AudioOutputNewQueue failed");
+//        
+//        UInt32 bufferByteSize;
+//        CalculateBytesForTime(player.playbackFile, dataFormat, 0.1, &bufferByteSize,&player.numPacketsToRead);
+//        
+//        bool isFormatVBR = (dataFormat.mBytesPerPacket == 0
+//                            || dataFormat.mFramesPerPacket == 0);
+//        if (isFormatVBR) {
+//            player.packetDescs = (AudioStreamPacketDescription*) malloc(sizeof(AudioStreamPacketDescription) * player.numPacketsToRead);
+//        } else {
+//            player.packetDescs = NULL;
+//        }
+//        
+//        MyCopyEncoderCookieToQueue(player.playbackFile, queue);
+//        
+//        
+//        // Player will start immediately, so we need to fill it with some data so that it doesn't play silence into the file
+//        // Call the callback function manually to solve
+//        
+//        AudioQueueBufferRef buffers[kNumberPlaybackBuffers];
+//        player.isDone = false;
+//        player.packetPosition = 0;
+//        for (int i=0; i<kNumberPlaybackBuffers; i++) {
+//            CheckError(AudioQueueAllocateBuffer(queue,
+//                                                bufferByteSize,
+//                                                &buffers[i]), "AudioQueueAllocateBuffer failed");
+//            MyAQOutputCallback(&player, queue, buffers[i]);
+//            
+//            if (player.isDone) {
+//                break;
+//            }
+//        }
+//        
+//        // Start Queue
+//        CheckError(AudioQueueStart(queue, NULL), "AudioQueueStart failed");
+//        
+//        printf("Playing...\n");
+//        
+//        do {
+//            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
+//        } while (!player.isDone);
+//        
+//        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2, false); // Handle any audio that may remain in buffers
+//        
+//        // Clean up queue when finished
+//        player.isDone = true;
+//        CheckError(AudioQueueStop(queue, TRUE), "AudioQueueStop failed");
+//        AudioFileClose(player.playbackFile);
+//        
+//    }
+//    return 0;
+//}
 
