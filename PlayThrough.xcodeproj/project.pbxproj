@@ -33,7 +33,6 @@
 		50909B5417B561DA00B97E52 /* PlayThrough-Prefix.pch */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "PlayThrough-Prefix.pch"; sourceTree = "<group>"; };
 		50909B5517B561DA00B97E52 /* PlayThrough.1 */ = {isa = PBXFileReference; lastKnownFileType = text.man; path = PlayThrough.1; sourceTree = "<group>"; };
 		50909B5C17B561F100B97E52 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
-		50909B5E17B569B600B97E52 /* test.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = test.m; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -78,7 +77,6 @@
 		50909B5017B561DA00B97E52 /* PlayThrough */ = {
 			isa = PBXGroup;
 			children = (
-				50909B5E17B569B600B97E52 /* test.m */,
 				50909B5117B561DA00B97E52 /* main.m */,
 				50909B5517B561DA00B97E52 /* PlayThrough.1 */,
 				50909B5317B561DA00B97E52 /* Supporting Files */,
